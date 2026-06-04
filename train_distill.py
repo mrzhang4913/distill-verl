@@ -560,6 +560,13 @@ class HFDistillationTrainer(Trainer):
 
         # ── Step 1：学生生成 response ─────────────────────────
         with torch.no_grad():
+            # 禁止生成 thinking 标签
+            think_ids = [
+                self.tokenizer.encode('<think>', add_special_tokens=False),
+                self.tokenizer.encode('</think>', add_special_tokens=False),
+            ]
+            bad_words_ids = [ids for ids in think_ids if ids]
+            
             generated = model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -569,6 +576,7 @@ class HFDistillationTrainer(Trainer):
                 top_p=0.9,
                 pad_token_id=self.tokenizer.pad_token_id,
                 eos_token_id=self.tokenizer.eos_token_id,
+                bad_words_ids=bad_words_ids if bad_words_ids else None,
             )
 
         # generated shape: [batch, prompt_len + gen_len]
@@ -677,14 +685,18 @@ def train_distillation(config_path: str, use_verl: bool = False):
             if config["training"].get("bf16", False) else torch.float32,
     )
 
-    # 设置 padding_side
-    # on-policy 生成需要 left-padding，off-policy 用 right-padding 也可以
-    # 统一用 left-padding 最安全
+    # 设置 padding_side（left-padding 对生成更安全）
     student_tokenizer.padding_side = "left"
     teacher_tokenizer.padding_side = "left"
     if student_tokenizer.pad_token is None:
         student_tokenizer.pad_token    = student_tokenizer.eos_token
         student_tokenizer.pad_token_id = student_tokenizer.eos_token_id
+
+    # gradient_checkpointing 和 use_cache 不兼容，禁用 use_cache
+    if config["training"].get("gradient_checkpointing", False):
+        student_model.config.use_cache = False
+        teacher_model.config.use_cache = False
+        logger.info("  Disabled use_cache (incompatible with gradient_checkpointing)")
 
     # 验证词表一致性
     assert teacher_tokenizer.vocab_size == student_tokenizer.vocab_size, (
@@ -770,6 +782,7 @@ def train_distillation(config_path: str, use_verl: bool = False):
         gradient_checkpointing=config["training"].get(
             "gradient_checkpointing", False
         ),
+        gradient_checkpointing_kwargs={"use_reentrant": False},
         logging_steps=config["training"]["logging_steps"],
         save_steps=config["training"]["save_steps"],
         save_total_limit=config["training"]["save_total_limit"],

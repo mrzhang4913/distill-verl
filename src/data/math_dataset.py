@@ -2,6 +2,7 @@
 """
 MATH 数据集加载和预处理
 支持 off-policy 和 on-policy 蒸馏
+确保 Qwen3 thinking mode 被完全禁用
 """
 
 import os
@@ -15,6 +16,21 @@ from datasets import load_dataset
 from transformers import PreTrainedTokenizer
 
 
+def remove_thinking_tags(text: str) -> str:
+    """
+    强制移除 Qwen3 的 thinking 标签
+    即使设置了 enable_thinking=False，Qwen3 tokenizer 仍会插入这些标签
+    """
+    # 移除完整的 <think>...</think> 块
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+    # 移除单独的标签（防止不完整的标签残留）
+    text = text.replace('<think>', '')
+    text = text.replace('</think>', '')
+    # 清理多余的空行
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text
+
+
 class MATHDataset(Dataset):
     """MATH 数据集封装"""
 
@@ -24,19 +40,19 @@ class MATHDataset(Dataset):
         split: str = "train",
         tokenizer: Optional[PreTrainedTokenizer] = None,
         max_length: int = 2048,
-        max_prompt_length: int = 512,   # prompt 最大长度
+        max_prompt_length: int = 512,
         system_prompt: str = "",
         add_solution: bool = True,
-        on_policy: bool = False,        # on-policy 模式只返回 prompt
+        on_policy: bool = False,
     ):
-        self.dataset_name     = dataset_name
-        self.split            = split
-        self.tokenizer        = tokenizer
-        self.max_length       = max_length
+        self.dataset_name      = dataset_name
+        self.split             = split
+        self.tokenizer         = tokenizer
+        self.max_length        = max_length
         self.max_prompt_length = max_prompt_length
-        self.system_prompt    = system_prompt
-        self.add_solution     = add_solution
-        self.on_policy        = on_policy
+        self.system_prompt     = system_prompt
+        self.add_solution      = add_solution
+        self.on_policy         = on_policy
 
         print(f"Loading {dataset_name} ({split})...")
         try:
@@ -58,27 +74,37 @@ class MATHDataset(Dataset):
             return {"problem": problem, "solution": solution}
 
         if self.on_policy:
-            # ── On-policy：只返回 prompt ──────────────────────
             return self._make_prompt_only(problem)
         else:
-            # ── Off-policy：返回完整序列 ──────────────────────
             return self._make_full_sequence(problem, solution)
 
+    def _apply_template(
+        self,
+        messages: list,
+        add_generation_prompt: bool,
+    ) -> str:
+        """
+        统一的 chat template 应用函数
+        强制禁用 thinking mode
+        """
+        text = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+            enable_thinking=False,
+        )
+        # 强制移除 thinking 标签（防止 Qwen3 bug）
+        text = remove_thinking_tags(text)
+        return text
+
     def _make_prompt_only(self, problem: str) -> Dict[str, Any]:
-        """
-        只返回 prompt 部分（system + user），用于 on-policy 生成
-        """
+        """只返回 prompt 部分，用于 on-policy 生成"""
         messages = [
             {"role": "system", "content": self.system_prompt},
             {"role": "user",   "content": problem},
         ]
 
-        prompt_text = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,  # 加上 <|im_start|>assistant\n
-            enable_thinking=False,
-        )
+        prompt_text = self._apply_template(messages, add_generation_prompt=True)
 
         encoding = self.tokenizer(
             prompt_text,
@@ -95,9 +121,7 @@ class MATHDataset(Dataset):
         }
 
     def _make_full_sequence(self, problem: str, solution: str) -> Dict[str, Any]:
-        """
-        返回完整序列（system + user + assistant），用于 off-policy 蒸馏
-        """
+        """返回完整序列，用于 off-policy 蒸馏"""
         messages = [
             {"role": "system",    "content": self.system_prompt},
             {"role": "user",      "content": problem},
@@ -105,11 +129,9 @@ class MATHDataset(Dataset):
         if self.add_solution and solution:
             messages.append({"role": "assistant", "content": solution})
 
-        text = self.tokenizer.apply_chat_template(
+        text = self._apply_template(
             messages,
-            tokenize=False,
             add_generation_prompt=False,
-            enable_thinking=False,
         )
 
         encoding = self.tokenizer(
@@ -133,7 +155,7 @@ class MATHDataset(Dataset):
 
 @dataclass
 class MATHDataCollator:
-    """数据批处理（同时支持 on-policy 和 off-policy）"""
+    """数据批处理（支持 on-policy 和 off-policy）"""
 
     tokenizer:          PreTrainedTokenizer
     padding:            bool          = True
@@ -148,24 +170,20 @@ class MATHDataCollator:
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
         batch = {}
 
-        # ── Input IDs ──────────────────────────────────────────
         input_ids = [f["input_ids"] for f in features if "input_ids" in f]
         if input_ids:
             batch["input_ids"] = self._pad_sequence(
                 input_ids, self.tokenizer.pad_token_id
             )
 
-        # ── Attention Mask ─────────────────────────────────────
         attn = [f["attention_mask"] for f in features if "attention_mask" in f]
         if attn:
             batch["attention_mask"] = self._pad_sequence(attn, 0)
 
-        # ── Labels（off-policy 用）─────────────────────────────
         labels = [f["labels"] for f in features if "labels" in f]
         if labels:
             batch["labels"] = self._pad_sequence(labels, -100)
 
-        # ── Prompt lengths（on-policy 用）──────────────────────
         prompt_lengths = [f["prompt_length"] for f in features
                           if "prompt_length" in f]
         if prompt_lengths:
@@ -187,7 +205,9 @@ class MATHDataCollator:
         padded = []
         for seq in sequences:
             seq = seq[:max_len]
-            padded.append(seq + [pad_value] * (max_len - len(seq)))
+            # left-padding
+            padding_length = max_len - len(seq)
+            padded.append([pad_value] * padding_length + seq)
         return torch.tensor(padded, dtype=torch.long)
 
 
@@ -197,10 +217,13 @@ def normalize_answer(s: str) -> str:
     s = str(s).strip()
     s = s.replace('\f', '\\f').replace('\n', ' ').replace('\r', '')
     s = s.replace("$", "")
-    s = s.replace("π", "\\pi")
-    s = s.replace("√", "\\sqrt")
+    s = s.replace("\u03c0", "\\pi")
+    s = s.replace("\u221a", "\\sqrt")
     s = re.sub(r"\\(left|right|[Bb]ig{1,2})\s*", "", s)
-    s = re.sub(r"\\(displaystyle|textstyle|scriptstyle|boldsymbol|mathbf|mathrm)\s*", "", s)
+    s = re.sub(
+        r"\\(displaystyle|textstyle|scriptstyle|boldsymbol|mathbf|mathrm)\s*",
+        "", s,
+    )
     s = re.sub(r"\\text\{[^}]*\}", "", s)
     s = re.sub(r"\s+", " ", s).strip()
     s = re.sub(r"\(\s+", "(", s)

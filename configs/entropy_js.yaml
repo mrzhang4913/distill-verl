@@ -51,7 +51,7 @@ distillation:
   beta: 0.5
   ignore_index: -100
   use_teacher_labels: false
-  entropy_temp: 1.0
+  entropy_temp: 0.3
   on_policy: true
   max_new_tokens: 512
 evaluation:
