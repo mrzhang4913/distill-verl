@@ -1,0 +1,398 @@
+# src/losses/distill_losses.py
+"""
+知识蒸馏损失函数
+- Forward KL: KL(P_teacher || P_student)
+- Reverse KL: KL(P_student || P_teacher)
+- Entropy-weighted JS: 基于熵的动态加权 JS 散度
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional, Tuple
+
+
+class DistillationLoss(nn.Module):
+    """
+    蒸馏损失基类
+    """
+    
+    def __init__(
+        self,
+        temperature: float = 2.0,
+        alpha: float = 0.5,
+        beta: float = 0.5,
+        ignore_index: int = -100,
+    ):
+        """
+        Args:
+            temperature: 温度参数，用于软化分布
+            alpha: CE loss 权重（学生自监督）
+            beta: KL/JS loss 权重（教师蒸馏）
+            ignore_index: 忽略的标签索引（padding）
+        """
+        super().__init__()
+        self.temperature = temperature
+        self.alpha = alpha
+        self.beta = beta
+        self.ignore_index = ignore_index
+    
+    def forward(
+        self,
+        student_logits: torch.Tensor,
+        teacher_logits: torch.Tensor,
+        labels: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, dict]:
+        """
+        计算损失
+        
+        Args:
+            student_logits: [batch, seq_len, vocab_size]
+            teacher_logits: [batch, seq_len, vocab_size]
+            labels: [batch, seq_len], 可选
+        
+        Returns:
+            loss: 标量损失
+            stats: 统计信息字典
+        """
+        raise NotImplementedError
+    
+    def _get_soft_targets(self, logits: torch.Tensor) -> torch.Tensor:
+        """
+        将 logits 转换为软标签（温度缩放 + softmax）
+        
+        Args:
+            logits: [batch, seq_len, vocab_size]
+        
+        Returns:
+            probs: [batch, seq_len, vocab_size]
+        """
+        return F.softmax(logits / self.temperature, dim=-1)
+    
+    def _compute_ce_loss(
+        self,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        计算标准交叉熵损失
+        
+        Args:
+            logits: [batch, seq_len, vocab_size]
+            labels: [batch, seq_len]
+        
+        Returns:
+            loss: 标量
+        """
+        # Flatten
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        
+        loss = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            ignore_index=self.ignore_index,
+            reduction="mean",
+        )
+        return loss
+    
+    def _compute_entropy(self, probs: torch.Tensor, eps: float = 1e-10) -> torch.Tensor:
+        """
+        计算香农熵
+        
+        Args:
+            probs: [batch, seq_len, vocab_size]
+            eps: 数值稳定性常数
+        
+        Returns:
+            entropy: [batch, seq_len]
+        """
+        return -torch.sum(probs * torch.log(probs + eps), dim=-1)
+
+
+class ForwardKLLoss(DistillationLoss):
+    """
+    Forward KL: KL(P_teacher || P_student)
+    
+    知识从教师流向学生，学生学习教师的完整分布
+    适合：教师分布可靠，学生需要完整学习
+    """
+    
+    def forward(
+        self,
+        student_logits: torch.Tensor,
+        teacher_logits: torch.Tensor,
+        labels: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, dict]:
+        """
+        Forward KL: KL(P_t || P_s) = Σ P_t * log(P_t / P_s)
+        """
+        # 软标签
+        p_teacher = self._get_soft_targets(teacher_logits)
+        p_student = self._get_soft_targets(student_logits)
+        
+        # Forward KL
+        # KL(P||Q) = Σ P * log(P/Q) = Σ P * (log P - log Q)
+        kl_loss = F.kl_div(
+            F.log_softmax(student_logits / self.temperature, dim=-1),
+            p_teacher,
+            reduction="batchmean",
+        ) * (self.temperature ** 2)
+        
+        # CE Loss（如果有标签）
+        ce_loss = torch.tensor(0.0, device=student_logits.device)
+        if labels is not None:
+            ce_loss = self._compute_ce_loss(student_logits, labels)
+        
+        # 总损失
+        total_loss = self.alpha * ce_loss + self.beta * kl_loss
+        
+        # 统计
+        with torch.no_grad():
+            student_entropy = self._compute_entropy(p_student).mean()
+            teacher_entropy = self._compute_entropy(p_teacher).mean()
+        
+        stats = {
+            "loss/total": total_loss.item(),
+            "loss/ce": ce_loss.item() if labels is not None else 0.0,
+            "loss/kl": kl_loss.item(),
+            "entropy/student": student_entropy.item(),
+            "entropy/teacher": teacher_entropy.item(),
+        }
+        
+        return total_loss, stats
+
+
+class ReverseKLLoss(DistillationLoss):
+    """
+    Reverse KL: KL(P_student || P_teacher)
+    
+    学生拟合教师的高概率区域，忽略长尾
+    适合：教师分布有噪声，学生只学习高置信度部分
+    """
+    
+    def forward(
+        self,
+        student_logits: torch.Tensor,
+        teacher_logits: torch.Tensor,
+        labels: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, dict]:
+        """
+        Reverse KL: KL(P_s || P_t) = Σ P_s * log(P_s / P_t)
+        """
+        # 软标签
+        p_teacher = self._get_soft_targets(teacher_logits)
+        p_student = self._get_soft_targets(student_logits)
+        
+        # Reverse KL
+        kl_loss = F.kl_div(
+            F.log_softmax(teacher_logits / self.temperature, dim=-1),
+            p_student,
+            reduction="batchmean",
+        ) * (self.temperature ** 2)
+        
+        # CE Loss
+        ce_loss = torch.tensor(0.0, device=student_logits.device)
+        if labels is not None:
+            ce_loss = self._compute_ce_loss(student_logits, labels)
+        
+        # 总损失
+        total_loss = self.alpha * ce_loss + self.beta * kl_loss
+        
+        # 统计
+        with torch.no_grad():
+            student_entropy = self._compute_entropy(p_student).mean()
+            teacher_entropy = self._compute_entropy(p_teacher).mean()
+        
+        stats = {
+            "loss/total": total_loss.item(),
+            "loss/ce": ce_loss.item() if labels is not None else 0.0,
+            "loss/kl": kl_loss.item(),
+            "entropy/student": student_entropy.item(),
+            "entropy/teacher": teacher_entropy.item(),
+        }
+        
+        return total_loss, stats
+
+
+class EntropyWeightedJSLoss(DistillationLoss):
+    """
+    Entropy-weighted JS 散度
+    
+    组合分布 M 使用 exponential aggregation：
+    - weight_i = exp(-H_i / temp) / Σ exp(-H_j / temp)
+    - M = weight_teacher * P_teacher + weight_student * P_student
+    
+    然后计算对称的 JS 散度：
+    - JS(P_t, P_s) = 0.5 * KL(P_t || M) + 0.5 * KL(P_s || M)
+    """
+    
+    def __init__(
+        self,
+        temperature: float = 2.0,
+        alpha: float = 0.5,
+        beta: float = 0.5,
+        ignore_index: int = -100,
+        entropy_temp: float = 1.0,
+    ):
+        """
+        Args:
+            entropy_temp: exponential aggregation 温度
+                         越小，低熵模型的权重越高
+        """
+        super().__init__(temperature, alpha, beta, ignore_index)
+        self.entropy_temp = entropy_temp
+    
+    def _exponential_aggregation(
+        self,
+        p_teacher: torch.Tensor,
+        p_student: torch.Tensor,
+        eps: float = 1e-10,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        基于熵的指数加权聚合
+        
+        Args:
+            p_teacher: [batch, seq_len, vocab_size]
+            p_student: [batch, seq_len, vocab_size]
+            eps: 数值稳定性常数
+        
+        Returns:
+            M: 组合分布 [batch, seq_len, vocab_size]
+            weight_teacher: [batch, seq_len, 1]
+            weight_student: [batch, seq_len, 1]
+        """
+        # 计算熵 [batch, seq_len]
+        H_teacher = self._compute_entropy(p_teacher, eps)
+        H_student = self._compute_entropy(p_student, eps)
+        
+        # Exponential weighting
+        # weight_i = exp(-H_i / temp) / Z
+        exp_teacher = torch.exp(-H_teacher / self.entropy_temp)
+        exp_student = torch.exp(-H_student / self.entropy_temp)
+        
+        Z = exp_teacher + exp_student
+        weight_teacher = (exp_teacher / Z).unsqueeze(-1)  # [batch, seq_len, 1]
+        weight_student = (exp_student / Z).unsqueeze(-1)
+        
+        # 组合分布
+        M = weight_teacher * p_teacher + weight_student * p_student
+        
+        # 数值稳定性：确保 M 是有效概率分布
+        M = torch.clamp(M, min=eps)
+        M = M / M.sum(dim=-1, keepdim=True)
+        
+        return M, weight_teacher, weight_student
+    
+    def forward(
+        self,
+        student_logits: torch.Tensor,
+        teacher_logits: torch.Tensor,
+        labels: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, dict]:
+        """
+        Entropy-weighted JS 散度
+        
+        JS(P_t, P_s) = 0.5 * KL(P_t || M) + 0.5 * KL(P_s || M)
+        其中 M 基于熵动态加权
+        """
+        # 软标签
+        p_teacher = self._get_soft_targets(teacher_logits)
+        p_student = self._get_soft_targets(student_logits)
+        
+        # Exponential aggregation
+        M, weight_teacher, weight_student = self._exponential_aggregation(
+            p_teacher, p_student
+        )
+        
+        # JS 散度 = 0.5 * KL(P_t || M) + 0.5 * KL(P_s || M)
+        log_M = torch.log(M + 1e-10)
+        
+        # KL(P_t || M)
+        kl_teacher_M = torch.sum(p_teacher * (torch.log(p_teacher + 1e-10) - log_M), dim=-1)
+        
+        # KL(P_s || M)
+        kl_student_M = torch.sum(p_student * (torch.log(p_student + 1e-10) - log_M), dim=-1)
+        
+        # JS 散度（对所有有效 token 取平均）
+        js_loss = 0.5 * (kl_teacher_M.mean() + kl_student_M.mean())
+        js_loss = js_loss * (self.temperature ** 2)  # 温度缩放
+        
+        # CE Loss
+        ce_loss = torch.tensor(0.0, device=student_logits.device)
+        if labels is not None:
+            ce_loss = self._compute_ce_loss(student_logits, labels)
+        
+        # 总损失
+        total_loss = self.alpha * ce_loss + self.beta * js_loss
+        
+        # 统计
+        with torch.no_grad():
+            student_entropy = self._compute_entropy(p_student).mean()
+            teacher_entropy = self._compute_entropy(p_teacher).mean()
+            M_entropy = self._compute_entropy(M).mean()
+            avg_weight_teacher = weight_teacher.mean()
+        
+        stats = {
+            "loss/total": total_loss.item(),
+            "loss/ce": ce_loss.item() if labels is not None else 0.0,
+            "loss/js": js_loss.item(),
+            "entropy/student": student_entropy.item(),
+            "entropy/teacher": teacher_entropy.item(),
+            "entropy/mixture": M_entropy.item(),
+            "weight/teacher": avg_weight_teacher.item(),
+            "weight/student": (1.0 - avg_weight_teacher).item(),
+        }
+        
+        return total_loss, stats
+
+
+# src/losses/distill_losses.py 末尾补全
+
+def get_distillation_loss(
+    mode: str,
+    temperature: float = 2.0,
+    alpha: float = 0.5,
+    beta: float = 0.5,
+    ignore_index: int = -100,
+    entropy_temp: float = 1.0,
+) -> DistillationLoss:
+    """
+    工厂函数：根据模式返回对应的损失函数
+    
+    Args:
+        mode: 'forward_kl' | 'reverse_kl' | 'entropy_js'
+        temperature: KL 温度
+        alpha: CE loss 权重
+        beta: KL/JS loss 权重
+        ignore_index: 忽略的标签索引
+        entropy_temp: (仅 entropy_js) exponential aggregation 温度
+    
+    Returns:
+        损失函数实例
+    """
+    if mode == "forward_kl":
+        return ForwardKLLoss(
+            temperature=temperature,
+            alpha=alpha,
+            beta=beta,
+            ignore_index=ignore_index,
+        )
+    elif mode == "reverse_kl":
+        return ReverseKLLoss(
+            temperature=temperature,
+            alpha=alpha,
+            beta=beta,
+            ignore_index=ignore_index,
+        )
+    elif mode == "entropy_js":
+        return EntropyWeightedJSLoss(
+            temperature=temperature,
+            alpha=alpha,
+            beta=beta,
+            ignore_index=ignore_index,
+            entropy_temp=entropy_temp,
+        )
+    else:
+        raise ValueError(f"Unknown distillation mode: {mode}. "
+                        f"Must be one of: forward_kl, reverse_kl, entropy_js")

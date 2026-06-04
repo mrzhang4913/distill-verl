@@ -1,0 +1,129 @@
+experiment_name: entropy_js_distill
+seed: 42
+teacher_model: Qwen/Qwen3-8B
+student_model: Qwen/Qwen3-1.7B
+use_lora: true
+lora_config:
+  r: 64
+  lora_alpha: 128
+  lora_dropout: 0.05
+  target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+  bias: none
+  task_type: CAUSAL_LM
+dataset:
+  name: nlile/hendrycks-MATH-benchmark
+  train_split: train
+  eval_split: test
+  max_length: 2048
+  num_workers: 4
+  max_prompt_length: 512
+training:
+  output_dir: ./outputs/entropy_js
+  num_epochs: 3
+  batch_size_per_device: 2
+  gradient_accumulation_steps: 8
+  eval_batch_size: 4
+  learning_rate: 0.0002
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  lr_scheduler_type: cosine
+  bf16: true
+  fp16: false
+  max_grad_norm: 1.0
+  gradient_checkpointing: true
+  logging_steps: 10
+  save_steps: 500
+  eval_steps: 500
+  save_total_limit: 3
+  ddp_find_unused_parameters: false
+  fsdp: ''
+distillation:
+  mode: entropy_js
+  temperature: 1.0
+  alpha: 0.5
+  beta: 0.5
+  ignore_index: -100
+  use_teacher_labels: false
+  entropy_temp: 1.0
+  on_policy: true
+  max_new_tokens: 512
+evaluation:
+  num_responses_per_problem: 10
+  max_new_tokens: 4096
+  temperature: 0.7
+  top_k: 50
+  top_p: 0.9
+  do_sample: true
+system_prompt: 'You are an expert math problem solver. Your task is to solve the given
+  problem step by step and output the final answer in a strictly defined format.
+
+
+  ### 1. RESPONSE STRUCTURE
+
+  You MUST format your response in two parts:
+
+  1. **Step-by-step reasoning**: Explain your solution clearly.
+
+  2. **Final Answer Block**: You MUST conclude your response with the exact block
+  below. If you omit this, your response is invalid.
+
+
+  <output>
+
+  [Insert ONLY the final bare answer here, with NO reasoning, NO text, and NO units]
+
+  </output>
+
+
+  ### 2. RULES FOR THE FINAL ANSWER (Inside `<output>`)
+
+  You must strictly follow these formatting constraints for the final answer:
+
+
+  **✅ STRICTLY ALLOWED (DO):**
+
+  - Use PLAIN TEXT or MINIMAL LaTeX.
+
+  - Fractions: Use `\frac{a}{b}` (Always prefer fractions over decimals unless asked
+  otherwise).
+
+  - Math Constants/Operators: Use LaTeX only (e.g., `\pi`, `\sqrt{}`, `\infty`).
+
+  - Coordinates/Tuples: Use `(a, b)` (Ensure a comma and a space).
+
+  - Sets: Use `\{a, b\}`.
+
+  - Intervals: Use `[a, b]`, `(a, b)`, `[a, b)`, etc.
+
+  - Degrees: Append `^\circ` (e.g., `45^\circ`).
+
+  - Integers: Write exactly as integers (e.g., `14`).
+
+
+  **❌ STRICTLY PROHIBITED (DO NOT):**
+
+  - DO NOT use auto-scaling or styling brackets: `\left`, `\right`, `\Big`, `\bigg`.
+
+  - DO NOT use text formatting: `\displaystyle`, `\boldsymbol`, `\text{}`.
+
+  - DO NOT use Unicode math symbols (e.g., NO π, √, ∞).
+
+  - DO NOT include units or trailing text (e.g., NO "radians", "cm", "x = ").
+
+  - DO NOT use trailing zeros or decimals for exact integers (e.g., NO `14.0`).
+
+  '
+verl:
+  enable: true
+  actor_num_gpus: 4
+  critic_num_gpus: 0
+  rollout_batch_size: 16
+  rollout_temperature: 1.0
+  use_gae: false
