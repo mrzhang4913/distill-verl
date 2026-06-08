@@ -214,24 +214,43 @@ class EntropyWeightedJSLoss(DistillationLoss):
 
     def _exponential_aggregation(
         self,
-        p_teacher: torch.Tensor,
-        p_student: torch.Tensor,
+        p_teacher: torch.Tensor,        # [B, T, V] 温度缩放后
+        p_student: torch.Tensor,        # [B, T, V] 温度缩放后
+        p_teacher_orig: torch.Tensor,   # [B, T, V] 原始概率
+        p_student_orig: torch.Tensor,   # [B, T, V] 原始概率
         eps: float = 1e-10,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """基于原始熵的指数加权聚合"""
-        # 注意：这里用温度缩放后的概率计算熵（用于权重计算）
-        # 因为我们想根据蒸馏空间的熵来决定权重
-        H_teacher = self._compute_entropy(p_teacher, eps)
-        H_student = self._compute_entropy(p_student, eps)
+        """
+        Per-token 熵加权聚合
+        
+        每个位置 t 根据该位置的熵独立计算权重：
+        - 如果 teacher[t] 熵低（确定），student[t] 熵高（不确定）→ teacher 权重高
+        - 如果 teacher[t] 熵高（不确定），student[t] 熵低（确定）→ student 权重高
+        
+        Args:
+            p_teacher/p_student: [B, T, V] 温度缩放后的概率
+            p_teacher_orig/p_student_orig: [B, T, V] 原始概率
+        
+        Returns:
+            M: [B, T, V] 混合分布
+            w_teacher: [B, T, 1] 每个位置的 teacher 权重
+            w_student: [B, T, 1] 每个位置的 student 权重
+        """
+        # 计算每个位置的熵 [B, T]
+        H_teacher = self._compute_entropy(p_teacher_orig, eps)  # [B, T]
+        H_student = self._compute_entropy(p_student_orig, eps)  # [B, T]
 
-        exp_t = torch.exp(-H_teacher / self.entropy_temp)
-        exp_s = torch.exp(-H_student / self.entropy_temp)
-        Z     = exp_t + exp_s
+        # 指数加权（每个位置独立计算）
+        exp_t = torch.exp(-H_teacher / self.entropy_temp)  # [B, T]
+        exp_s = torch.exp(-H_student / self.entropy_temp)  # [B, T]
+        Z     = exp_t + exp_s                              # [B, T]
 
-        w_teacher = (exp_t / Z).unsqueeze(-1)
-        w_student = (exp_s / Z).unsqueeze(-1)
+        # 权重：[B, T] → [B, T, 1] 用于广播
+        w_teacher = (exp_t / Z).unsqueeze(-1)  # [B, T, 1]
+        w_student = (exp_s / Z).unsqueeze(-1)  # [B, T, 1]
 
-        M = w_teacher * p_teacher + w_student * p_student
+        # 混合分布：每个位置用不同的权重
+        M = w_teacher * p_teacher + w_student * p_student  # [B, T, V]
         M = torch.clamp(M, min=eps)
         M = M / M.sum(dim=-1, keepdim=True)
 
@@ -244,12 +263,17 @@ class EntropyWeightedJSLoss(DistillationLoss):
         labels: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:
 
-        # ── JS 损失 ──────────────────────────────────────────
+        # ── JS 损失：用温度缩放的概率 ──────────────────────
         p_teacher_soft = self._get_soft_probs(teacher_logits)
         p_student_soft = self._get_soft_probs(student_logits)
 
+        # ── 权重计算：用原始概率的熵（不受温度影响）──────
+        p_teacher_orig = self._get_original_probs(teacher_logits)
+        p_student_orig = self._get_original_probs(student_logits)
+
         M, w_teacher, w_student = self._exponential_aggregation(
-            p_teacher_soft, p_student_soft
+            p_teacher_soft, p_student_soft,
+            p_teacher_orig, p_student_orig,
         )
         log_M = torch.log(M + 1e-10)
 

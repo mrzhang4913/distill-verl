@@ -21,7 +21,7 @@ dataset:
   name: nlile/hendrycks-MATH-benchmark
   train_split: train
   eval_split: test
-  max_length: 2048
+  max_length: 2560
   num_workers: 4
   max_prompt_length: 512
 training:
@@ -38,7 +38,7 @@ training:
   fp16: false
   max_grad_norm: 1.0
   gradient_checkpointing: true
-  logging_steps: 10
+  logging_steps: 1
   save_steps: 500
   eval_steps: 500
   save_total_limit: 3
@@ -51,9 +51,9 @@ distillation:
   beta: 0.5
   ignore_index: -100
   use_teacher_labels: false
-  entropy_temp: 0.3
+  entropy_temp: 1.0
   on_policy: true
-  max_new_tokens: 512
+  max_new_tokens: 2048
 evaluation:
   num_responses_per_problem: 10
   max_new_tokens: 4096

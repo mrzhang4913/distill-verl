@@ -567,6 +567,12 @@ class HFDistillationTrainer(Trainer):
             ]
             bad_words_ids = [ids for ids in think_ids if ids]
             
+            # 提前停止条件：遇到 EOS 或 </output> 标签
+            output_tag_id = self.tokenizer.encode('</output>', add_special_tokens=False)
+            eos_token_ids = [self.tokenizer.eos_token_id]
+            if output_tag_id:
+                eos_token_ids.extend(output_tag_id)
+            
             generated = model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -575,8 +581,9 @@ class HFDistillationTrainer(Trainer):
                 temperature=0.9,
                 top_p=0.9,
                 pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
+                eos_token_id=eos_token_ids,  # 多个停止条件
                 bad_words_ids=bad_words_ids if bad_words_ids else None,
+                use_cache=False,
             )
 
         # generated shape: [batch, prompt_len + gen_len]
@@ -692,11 +699,10 @@ def train_distillation(config_path: str, use_verl: bool = False):
         student_tokenizer.pad_token    = student_tokenizer.eos_token
         student_tokenizer.pad_token_id = student_tokenizer.eos_token_id
 
-    # gradient_checkpointing 和 use_cache 不兼容，禁用 use_cache
-    if config["training"].get("gradient_checkpointing", False):
-        student_model.config.use_cache = False
-        teacher_model.config.use_cache = False
-        logger.info("  Disabled use_cache (incompatible with gradient_checkpointing)")
+    # 强制禁用 use_cache（与 gradient checkpointing 冲突）
+    student_model.config.use_cache = False
+    teacher_model.config.use_cache = False
+    logger.info("  Disabled use_cache for both models")
 
     # 验证词表一致性
     assert teacher_tokenizer.vocab_size == student_tokenizer.vocab_size, (
@@ -743,19 +749,29 @@ def train_distillation(config_path: str, use_verl: bool = False):
 
     # 损失函数
     on_policy = config["distillation"].get("on_policy", False)
+    entropy_temp_config = config["distillation"].get("entropy_temp", 1.0)
+    
     loss_fn = get_distillation_loss(
         mode=config["distillation"]["mode"],
         temperature=config["distillation"]["temperature"],
         alpha=config["distillation"]["alpha"],
         beta=config["distillation"]["beta"],
         ignore_index=config["distillation"]["ignore_index"],
-        entropy_temp=config["distillation"].get("entropy_temp", 1.0),
+        entropy_temp=entropy_temp_config,
         on_policy=on_policy,
     )
+    
     if on_policy:
         logger.info("  On-policy mode: using KL loss only (CE disabled)")
     else:
         logger.info(f"  Off-policy mode: alpha={config['distillation']['alpha']} * CE + beta={config['distillation']['beta']} * KL")
+    
+    # DEBUG: 验证 loss_fn 的参数
+    logger.info(f"  Loss function created:")
+    logger.info(f"    mode={config['distillation']['mode']}")
+    logger.info(f"    entropy_temp={entropy_temp_config}")
+    if hasattr(loss_fn, 'entropy_temp'):
+        logger.info(f"    loss_fn.entropy_temp={loss_fn.entropy_temp}")
 
     # Data Collator
     data_collator = MATHDataCollator(
@@ -766,6 +782,10 @@ def train_distillation(config_path: str, use_verl: bool = False):
 
     # Training Arguments
     logger.info("\nUsing HuggingFace Trainer")
+    
+    # 强制模型配置
+    student_model.config.use_cache = False
+    
     training_args = TrainingArguments(
         output_dir=config["training"]["output_dir"],
         num_train_epochs=config["training"]["num_epochs"],
