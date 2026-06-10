@@ -31,7 +31,7 @@ for i in "${!CONFIGS[@]}"; do
     
     # 训练
     echo "Step 1/2: Training with ${CONFIG}..."
-    python train_distill.py --config "${CONFIG}"
+    python train_distill.py --config "${CONFIG}" --no-verl
     
     # 检查训练是否成功
     CHECKPOINT_DIR="./outputs/${METHOD}/checkpoints/final"

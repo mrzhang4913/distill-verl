@@ -33,13 +33,13 @@ AutoModelForCausalLM.from_pretrained('Qwen/Qwen3-1.7B')
 "
 3. 单个实验训练
 # Forward KL
-python train_distill.py --config configs/forward_kl.yaml
+python train_distill.py --config configs/forward_kl.yaml --no-verl
 
 # Reverse KL
-python train_distill.py --config configs/reverse_kl.yaml
+python train_distill.py --config configs/reverse_kl.yaml --no-verl
 
 # Entropy-weighted JS
-python train_distill.py --config configs/entropy_js.yaml
+python train_distill.py --config configs/entropy_js.yaml --no-verl
 4. 评估训练好的模型
 # 评估 Forward KL 模型
 python eval_math500.py \
