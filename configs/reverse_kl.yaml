@@ -52,7 +52,7 @@ distillation:
   ignore_index: -100
   use_teacher_labels: false
   on_policy: true
-  max_new_tokens: 512
+  max_new_tokens: 16
 evaluation:
   num_responses_per_problem: 10
   max_new_tokens: 4096
@@ -120,7 +120,7 @@ system_prompt: 'You are an expert math problem solver. Your task is to solve the
 
   '
 verl:
-  enable: true
+  enable: false
   actor_num_gpus: 4
   critic_num_gpus: 0
   rollout_batch_size: 16

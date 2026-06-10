@@ -1,0 +1,52 @@
+experiment_name: test_onpolicy
+seed: 42
+teacher_model: Qwen/Qwen3-8B
+student_model: Qwen/Qwen3-1.7B
+use_lora: true
+lora_config:
+  r: 8
+  lora_alpha: 16
+  lora_dropout: 0.05
+  target_modules:
+  - q_proj
+  - v_proj
+  bias: none
+  task_type: CAUSAL_LM
+dataset:
+  name: nlile/hendrycks-MATH-benchmark
+  train_split: train
+  eval_split: test
+  max_length: 512
+  max_prompt_length: 128
+  num_workers: 2
+training:
+  output_dir: ./outputs/test_onpolicy
+  num_epochs: 1
+  batch_size_per_device: 1
+  gradient_accumulation_steps: 1
+  learning_rate: 0.0002
+  bf16: true
+  gradient_checkpointing: true
+  logging_steps: 1
+  save_steps: 9999
+  eval_steps: 0
+  save_total_limit: 1
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  lr_scheduler_type: cosine
+  fp16: false
+  max_grad_norm: 1.0
+  ddp_find_unused_parameters: false
+  fsdp: ''
+  eval_batch_size: 2
+distillation:
+  mode: forward_kl
+  on_policy: true
+  max_new_tokens: 16
+  temperature: 1.0
+  alpha: 0.5
+  beta: 0.5
+  ignore_index: -100
+system_prompt: You are a math expert.
+verl:
+  enable: false

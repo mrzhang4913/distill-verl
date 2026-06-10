@@ -40,13 +40,13 @@ export TRANSFORMERS_OFFLINE=1
 快速开始
 单个实验
 # Forward KL
-python train_distill.py --config configs/forward_kl.yaml
+python train_distill.py --config configs/forward_kl.yaml --no-verl
 
 # Reverse KL
-python train_distill.py --config configs/reverse_kl.yaml
+python train_distill.py --config configs/reverse_kl.yaml --no-verl
 
 # Entropy-weighted JS
-python train_distill.py --config configs/entropy_js.yaml
+python train_distill.py --config configs/entropy_js.yaml --no-verl
 运行所有实验并评估
 bash run_all_experiments.sh
 这会依次训练三个模型，然后在 MATH-500 上评估，输出到 results/ 目录。

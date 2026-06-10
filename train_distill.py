@@ -644,10 +644,17 @@ class HFDistillationTrainer(Trainer):
         return (loss, student_outputs) if return_outputs else loss
 
     def _log_stats(self, stats: dict):
-        """记录训练统计信息"""
-        if self.state.global_step % self.args.logging_steps == 0:
-            for key, value in stats.items():
-                self.log({f"train/{key}": value})
+        """
+        记录训练统计信息到 TensorBoard
+        
+        注意：
+        - HF Trainer 会在 key 前自动加 "train/" 前缀（训练时）
+        - 所以这里直接用 key 本身，不要加 "train/" 前缀
+        - self.log() 每步都会被调用，但只在 logging_steps 时写入
+        """
+        # 直接用原始 key，不加 "train/" 前缀（避免 train/train/xxx 重复）
+        log_dict = {key: value for key, value in stats.items()}
+        self.log(log_dict)
 
 
 # ============================================================
@@ -818,7 +825,22 @@ def train_distillation(config_path: str, use_verl: bool = False):
         remove_unused_columns=False,   # ✅ 关键：不自动删除列
     )
 
-    # 创建 Trainer
+    # 选择训练器
+    # VERL 需要单独配置，目前默认使用 HuggingFace Trainer
+    use_verl_trainer = (
+        use_verl                              # 命令行参数
+        and verl is not None                  # VERL 已安装
+        and config.get("verl", {}).get("enable", False)  # 配置文件启用
+    )
+    
+    if use_verl_trainer:
+        logger.warning("=" * 60)
+        logger.warning("⚠️  VERL trainer is not fully implemented yet!")
+        logger.warning("⚠️  Falling back to HuggingFace Trainer")
+        logger.warning("⚠️  To use VERL, please contact the author")
+        logger.warning("=" * 60)
+    
+    # 创建 Trainer（目前只支持 HuggingFace Trainer）
     trainer = HFDistillationTrainer(
         teacher_model=teacher_model,
         loss_fn=loss_fn,
